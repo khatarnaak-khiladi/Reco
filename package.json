@@ -27,7 +27,7 @@
     "web-vitals": "^2.1.4"
   },
   "scripts": {
-    "start": "react-scripts start",
+    "start": "node gun-server.js",
     "gun-server": "node gun-server.js",
     "smoke-test": "node scripts/smoke_test.js",
     "build": "react-scripts build",
