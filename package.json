@@ -14,30 +14,24 @@
     "@fontsource/rationale": "^5.1.0",
     "@mui/icons-material": "^6.1.1",
     "@mui/material": "^6.1.1",
-    "@peculiar/webcrypto": "^1.4.0",
     "@testing-library/jest-dom": "^5.17.0",
     "@testing-library/react": "^13.4.0",
     "@testing-library/user-event": "^13.5.0",
     "framer-motion": "^11.5.6",
-    "gun": "^0.2020.1240",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
     "react-router-dom": "^6.26.2",
     "react-scripts": "5.0.1",
+    "socket.io-client": "^4.7.2",
     "web-vitals": "^2.1.4"
   },
   "scripts": {
-    "start": "node gun-server.js",
-    "gun-server": "node gun-server.js",
-    "smoke-test": "node scripts/smoke_test.js",
+    "start": "react-scripts start",
     "build": "react-scripts build",
     "test": "react-scripts test",
-    "eject": "react-scripts eject",
-    "postinstall": "patch-package"
+    "eject": "react-scripts eject"
   },
-  "devDependencies": {
-    "patch-package": "^6.5.0"
-  },
+  "devDependencies": {},
   "eslintConfig": {
     "extends": [
       "react-app",
@@ -55,5 +49,6 @@
       "last 1 firefox version",
       "last 1 safari version"
     ]
-  }
+  },
+  "proxy": "http://localhost:3001"
 }
