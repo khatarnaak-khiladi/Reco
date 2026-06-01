@@ -1,37 +1,32 @@
 const express = require('express');
 const http = require('http');
-const socketIo = require('socket.io');
+const { Server } = require('socket.io');
 const cors = require('cors');
 
 const app = express();
 const server = http.createServer(app);
-const io = socketIo(server, {
+
+app.use(cors({
+  origin: true,
+  credentials: true
+}));
+
+app.use(express.json());
+
+const io = new Server(server, {
   cors: {
-    origin: [
-      'http://localhost:3000',
-      'http://localhost:5000',
-      'http://localhost:8100',
-      'http://192.168.1.*:*',
-      /^https?:\/\/.*\.railway\.app$/,
-      'capacitor://localhost',
-      '*'
-    ],
-    methods: ['GET', 'POST'],
+    origin: true,
     credentials: true
   },
   transports: ['websocket', 'polling']
 });
 
-app.use(cors());
-app.use(express.json());
+const PORT = process.env.PORT || 8080;
 
-const PORT = process.env.PORT || 3001;
+// Room storage
+const rooms = new Map();
+const userSockets = new Map();
 
-// Room and user tracking
-const rooms = new Map(); // { roomCode: { users: [{ id, name, socketId }], messages: [] } }
-const userSockets = new Map(); // { socketId: { userId, name, roomCode } }
-
-// Initialize room if not exists
 function getOrCreateRoom(roomCode) {
   if (!rooms.has(roomCode)) {
     rooms.set(roomCode, {
@@ -43,202 +38,161 @@ function getOrCreateRoom(roomCode) {
   return rooms.get(roomCode);
 }
 
-// Health check endpoint
-app.get('/health', (req, res) => {
-  res.json({ status: 'ok', timestamp: Date.now() });
+// Root route
+app.get('/', (req, res) => {
+  res.send('Socket.IO backend running');
 });
 
-// Stats endpoint for monitoring
-app.get('/stats', (req, res) => {
-  const activeRooms = rooms.size;
-  const totalUsers = Array.from(rooms.values()).reduce((sum, room) => sum + room.users.length, 0);
-  const totalMessages = Array.from(rooms.values()).reduce((sum, room) => sum + room.messages.length, 0);
-  
+// Health route
+app.get('/health', (req, res) => {
   res.json({
-    activeRooms,
-    totalUsers,
-    totalMessages,
+    status: 'ok',
+    timestamp: Date.now(),
     uptime: process.uptime()
   });
 });
 
-// Socket.IO connection handling
-io.on('connection', (socket) => {
-  console.log(`[${new Date().toISOString()}] User connected: ${socket.id}`);
+// Stats route
+app.get('/stats', (req, res) => {
+  const activeRooms = rooms.size;
+  const totalUsers = Array.from(rooms.values()).reduce(
+    (sum, room) => sum + room.users.length,
+    0
+  );
 
-  // Join room event
+  res.json({
+    activeRooms,
+    totalUsers,
+    uptime: process.uptime()
+  });
+});
+
+io.on('connection', (socket) => {
+  console.log('User connected:', socket.id);
+
   socket.on('join_room', ({ roomCode, userName }, callback) => {
     try {
       if (!roomCode || !userName) {
-        return callback({ success: false, error: 'Missing roomCode or userName' });
-      }
-
-      // Leave any previous room
-      if (userSockets.has(socket.id)) {
-        const previousRoom = userSockets.get(socket.id).roomCode;
-        if (previousRoom) {
-          socket.leave(previousRoom);
-          broadcastUserLeft(previousRoom, userName);
-        }
-      }
-
-      // Join new room
-      socket.join(roomCode);
-      const room = getOrCreateRoom(roomCode);
-
-      // Check if user already in room
-      const existingUserIndex = room.users.findIndex(u => u.name === userName);
-      if (existingUserIndex >= 0) {
-        room.users[existingUserIndex].socketId = socket.id;
-      } else {
-        room.users.push({
-          id: `${roomCode}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-          name: userName,
-          socketId: socket.id,
-          joinedAt: Date.now()
+        return callback?.({
+          success: false,
+          error: 'Missing roomCode or userName'
         });
       }
 
-      userSockets.set(socket.id, { userName, roomCode });
+      const room = getOrCreateRoom(roomCode);
 
-      // Send current room state to joining user
-      callback({
-        success: true,
+      socket.join(roomCode);
+
+      const existing = room.users.find(
+        (u) => u.name === userName
+      );
+
+      if (!existing) {
+        room.users.push({
+          id: Date.now().toString(),
+          name: userName,
+          socketId: socket.id
+        });
+      }
+
+      userSockets.set(socket.id, {
         roomCode,
-        users: room.users.map(u => ({ id: u.id, name: u.name })),
-        messages: room.messages.slice(-50) // Last 50 messages
+        userName
       });
 
-      // Broadcast user joined
+      callback?.({
+        success: true,
+        users: room.users,
+        messages: room.messages
+      });
+
       io.to(roomCode).emit('user_joined', {
         userName,
-        timestamp: Date.now(),
-        users: room.users.map(u => ({ id: u.id, name: u.name }))
+        users: room.users
       });
 
-      console.log(`[${new Date().toISOString()}] ${userName} joined room ${roomCode}. Users in room: ${room.users.length}`);
-    } catch (error) {
-      console.error(`[${new Date().toISOString()}] Error in join_room:`, error);
-      callback({ success: false, error: error.message });
+    } catch (err) {
+      console.error(err);
+
+      callback?.({
+        success: false,
+        error: err.message
+      });
     }
   });
 
-  // Send message event
-  socket.on('send_message', ({ roomCode, message, timestamp }, callback) => {
+  socket.on('send_message', ({ roomCode, message }, callback) => {
     try {
       const userInfo = userSockets.get(socket.id);
+
       if (!userInfo) {
-        return callback({ success: false, error: 'User not in a room' });
+        return callback?.({
+          success: false,
+          error: 'Not joined to room'
+        });
       }
 
       const room = getOrCreateRoom(roomCode);
-      const messageId = `msg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-      const msgData = {
-        id: messageId,
+
+      const msg = {
+        id: Date.now().toString(),
         from: userInfo.userName,
         text: message,
-        timestamp: timestamp || Date.now(),
-        delivered: false
+        timestamp: Date.now()
       };
 
-      // Store message
-      room.messages.push(msgData);
-      if (room.messages.length > 200) {
-        room.messages.shift(); // Keep only last 200
-      }
+      room.messages.push(msg);
 
-      // Broadcast to all users in room
-      io.to(roomCode).emit('receive_message', msgData);
+      io.to(roomCode).emit('receive_message', msg);
 
-      // Acknowledge delivery
-      callback({ success: true, messageId, delivered: true });
-
-      console.log(`[${new Date().toISOString()}] Message from ${userInfo.userName} in ${roomCode}: ${message.substring(0, 50)}`);
-    } catch (error) {
-      console.error(`[${new Date().toISOString()}] Error in send_message:`, error);
-      callback({ success: false, error: error.message });
-    }
-  });
-
-  // Get room users
-  socket.on('get_room_users', ({ roomCode }, callback) => {
-    try {
-      const room = getOrCreateRoom(roomCode);
-      callback({
-        success: true,
-        users: room.users.map(u => ({ id: u.id, name: u.name })),
-        count: room.users.length
+      callback?.({
+        success: true
       });
-    } catch (error) {
-      console.error(`[${new Date().toISOString()}] Error in get_room_users:`, error);
-      callback({ success: false, error: error.message });
+
+    } catch (err) {
+      console.error(err);
+
+      callback?.({
+        success: false,
+        error: err.message
+      });
     }
   });
 
-  // Ping for connection check
-  socket.on('ping', (callback) => {
-    callback({ pong: true, timestamp: Date.now() });
-  });
-
-  // Disconnect
   socket.on('disconnect', () => {
-    try {
-      const userInfo = userSockets.get(socket.id);
-      if (userInfo) {
-        const { userName, roomCode } = userInfo;
-        broadcastUserLeft(roomCode, userName);
-        console.log(`[${new Date().toISOString()}] ${userName} disconnected from ${roomCode}`);
+    const userInfo = userSockets.get(socket.id);
+
+    if (userInfo) {
+      const room = rooms.get(userInfo.roomCode);
+
+      if (room) {
+        room.users = room.users.filter(
+          (u) => u.socketId !== socket.id
+        );
+
+        io.to(userInfo.roomCode).emit('user_left', {
+          userName: userInfo.userName,
+          users: room.users
+        });
       }
+
       userSockets.delete(socket.id);
-    } catch (error) {
-      console.error(`[${new Date().toISOString()}] Error in disconnect:`, error);
     }
+
+    console.log('User disconnected:', socket.id);
   });
 });
 
-// Helper function to broadcast user left
-function broadcastUserLeft(roomCode, userName) {
-  const room = getOrCreateRoom(roomCode);
-  room.users = room.users.filter(u => u.name !== userName);
-  
-  io.to(roomCode).emit('user_left', {
-    userName,
-    timestamp: Date.now(),
-    users: room.users.map(u => ({ id: u.id, name: u.name })),
-    count: room.users.length
+// Error logging
+app.use((err, req, res, next) => {
+  console.error('Express Error:', err);
+
+  res.status(500).json({
+    error: err.message
   });
-  
-  // Clean up empty room after 1 hour
-  if (room.users.length === 0) {
-    setTimeout(() => {
-      const r = rooms.get(roomCode);
-      if (r && r.users.length === 0) {
-        rooms.delete(roomCode);
-        console.log(`[${new Date().toISOString()}] Cleaned up empty room: ${roomCode}`);
-      }
-    }, 60 * 60 * 1000);
-  }
-}
-
-// Error handling
-process.on('unhandledRejection', (reason, promise) => {
-  console.error('[ERROR] Unhandled Rejection at:', promise, 'reason:', reason);
-});
-
-process.on('uncaughtException', (error) => {
-  console.error('[ERROR] Uncaught Exception:', error);
-  process.exit(1);
 });
 
 server.listen(PORT, '0.0.0.0', () => {
-  console.log(`
-╔════════════════════════════════════════════════════════╗
-║  Socket.IO Chat Server Running                         ║
-║  PORT: ${PORT}                                              ║
-║  Environment: ${process.env.NODE_ENV || 'development'}                          ║
-║  URL: ${process.env.RAILWAY_PUBLIC_DOMAIN ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}` : `http://localhost:${PORT}`}  ║
-╚════════════════════════════════════════════════════════╝
-  `);
+  console.log(`Socket.IO Chat Server Running`);
+  console.log(`PORT: ${PORT}`);
 });
-
-module.exports = server;
