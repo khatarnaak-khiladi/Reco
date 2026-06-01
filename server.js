@@ -1,194 +1,244 @@
-import io from 'socket.io-client';
+const express = require('express');
+const http = require('http');
+const socketIo = require('socket.io');
+const cors = require('cors');
 
-const STORAGE_KEY = 'chatServerUrl';
+const app = express();
+const server = http.createServer(app);
+const io = socketIo(server, {
+  cors: {
+    origin: [
+      'http://localhost:3000',
+      'http://localhost:5000',
+      'http://localhost:8100',
+      'http://192.168.1.*:*',
+      /^https?:\/\/.*\.railway\.app$/,
+      'capacitor://localhost',
+      '*'
+    ],
+    methods: ['GET', 'POST'],
+    credentials: true
+  },
+  transports: ['websocket', 'polling']
+});
 
-const getBackendUrl = () => {
-  return "https://reco-production-8190.up.railway.app";
-};
+app.use(cors());
+app.use(express.json());
 
-class SocketService {
-  constructor() {
-    this.socket = null;
-    this.isConnected = false;
-    this.listeners = {};
-  }
+const PORT = process.env.PORT || 3001;
 
-  connect(backendUrl = null) {
-    return new Promise((resolve, reject) => {
-      try {
-        const url = backendUrl || getBackendUrl();
-        console.log(`[SocketService] Connecting to ${url}`);
+// Room and user tracking
+const rooms = new Map(); // { roomCode: { users: [{ id, name, socketId }], messages: [] } }
+const userSockets = new Map(); // { socketId: { userId, name, roomCode } }
 
-        this.socket = io(url, {
-          reconnection: true,
-          reconnectionDelay: 1000,
-          reconnectionDelayMax: 5000,
-          reconnectionAttempts: 5,
-          transports: ['websocket', 'polling'],
-          autoConnect: true,
-        });
-
-        this.socket.on('connect', () => {
-          this.isConnected = true;
-          console.log('[SocketService] Connected:', this.socket.id);
-          this.emit('connected');
-          resolve(this.socket.id);
-        });
-
-        this.socket.on('connect_error', (error) => {
-          console.error('[SocketService] Connection error:', error);
-          this.emit('connection_error', error);
-          reject(error);
-        });
-
-        this.socket.on('reconnect_attempt', () => {
-          console.log('[SocketService] Attempting to reconnect...');
-          this.emit('reconnecting');
-        });
-
-        this.socket.on('reconnect', () => {
-          this.isConnected = true;
-          console.log('[SocketService] Reconnected');
-          this.emit('reconnected');
-        });
-
-        this.socket.on('disconnect', () => {
-          this.isConnected = false;
-          console.log('[SocketService] Disconnected');
-          this.emit('disconnected');
-        });
-      } catch (error) {
-        console.error('[SocketService] Connection failed:', error);
-        reject(error);
-      }
+// Initialize room if not exists
+function getOrCreateRoom(roomCode) {
+  if (!rooms.has(roomCode)) {
+    rooms.set(roomCode, {
+      users: [],
+      messages: [],
+      createdAt: Date.now()
     });
   }
+  return rooms.get(roomCode);
+}
 
-  joinRoom(roomCode, userName) {
-    return new Promise((resolve, reject) => {
-      if (!this.socket || !this.isConnected) {
-        return reject(new Error('Socket not connected'));
+// Health check endpoint
+app.get('/health', (req, res) => {
+  res.json({ status: 'ok', timestamp: Date.now() });
+});
+
+// Stats endpoint for monitoring
+app.get('/stats', (req, res) => {
+  const activeRooms = rooms.size;
+  const totalUsers = Array.from(rooms.values()).reduce((sum, room) => sum + room.users.length, 0);
+  const totalMessages = Array.from(rooms.values()).reduce((sum, room) => sum + room.messages.length, 0);
+  
+  res.json({
+    activeRooms,
+    totalUsers,
+    totalMessages,
+    uptime: process.uptime()
+  });
+});
+
+// Socket.IO connection handling
+io.on('connection', (socket) => {
+  console.log(`[${new Date().toISOString()}] User connected: ${socket.id}`);
+
+  // Join room event
+  socket.on('join_room', ({ roomCode, userName }, callback) => {
+    try {
+      if (!roomCode || !userName) {
+        return callback({ success: false, error: 'Missing roomCode or userName' });
       }
 
-      this.socket.emit('join_room', { roomCode, userName }, (response) => {
-        if (response.success) {
-          console.log('[SocketService] Joined room:', roomCode);
-          resolve(response);
-        } else {
-          console.error('[SocketService] Failed to join room:', response.error);
-          reject(new Error(response.error));
+      // Leave any previous room
+      if (userSockets.has(socket.id)) {
+        const previousRoom = userSockets.get(socket.id).roomCode;
+        if (previousRoom) {
+          socket.leave(previousRoom);
+          broadcastUserLeft(previousRoom, userName);
         }
-      });
-    });
-  }
-
-  sendMessage(roomCode, message, timestamp) {
-    return new Promise((resolve, reject) => {
-      if (!this.socket || !this.isConnected) {
-        return reject(new Error('Socket not connected'));
       }
 
-      this.socket.emit('send_message', { roomCode, message, timestamp }, (response) => {
-        if (response.success) {
-          console.log('[SocketService] Message sent:', response.messageId);
-          resolve(response);
-        } else {
-          console.error('[SocketService] Failed to send message:', response.error);
-          reject(new Error(response.error));
-        }
-      });
-    });
-  }
+      // Join new room
+      socket.join(roomCode);
+      const room = getOrCreateRoom(roomCode);
 
-  getRoomUsers(roomCode) {
-    return new Promise((resolve, reject) => {
-      if (!this.socket || !this.isConnected) {
-        return reject(new Error('Socket not connected'));
+      // Check if user already in room
+      const existingUserIndex = room.users.findIndex(u => u.name === userName);
+      if (existingUserIndex >= 0) {
+        room.users[existingUserIndex].socketId = socket.id;
+      } else {
+        room.users.push({
+          id: `${roomCode}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+          name: userName,
+          socketId: socket.id,
+          joinedAt: Date.now()
+        });
       }
 
-      this.socket.emit('get_room_users', { roomCode }, (response) => {
-        if (response.success) {
-          resolve(response);
-        } else {
-          reject(new Error(response.error));
-        }
-      });
-    });
-  }
+      userSockets.set(socket.id, { userName, roomCode });
 
-  ping() {
-    return new Promise((resolve, reject) => {
-      if (!this.socket || !this.isConnected) {
-        return reject(new Error('Socket not connected'));
+      // Send current room state to joining user
+      callback({
+        success: true,
+        roomCode,
+        users: room.users.map(u => ({ id: u.id, name: u.name })),
+        messages: room.messages.slice(-50) // Last 50 messages
+      });
+
+      // Broadcast user joined
+      io.to(roomCode).emit('user_joined', {
+        userName,
+        timestamp: Date.now(),
+        users: room.users.map(u => ({ id: u.id, name: u.name }))
+      });
+
+      console.log(`[${new Date().toISOString()}] ${userName} joined room ${roomCode}. Users in room: ${room.users.length}`);
+    } catch (error) {
+      console.error(`[${new Date().toISOString()}] Error in join_room:`, error);
+      callback({ success: false, error: error.message });
+    }
+  });
+
+  // Send message event
+  socket.on('send_message', ({ roomCode, message, timestamp }, callback) => {
+    try {
+      const userInfo = userSockets.get(socket.id);
+      if (!userInfo) {
+        return callback({ success: false, error: 'User not in a room' });
       }
 
-      this.socket.emit('ping', (response) => {
-        resolve(response);
+      const room = getOrCreateRoom(roomCode);
+      const messageId = `msg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      const msgData = {
+        id: messageId,
+        from: userInfo.userName,
+        text: message,
+        timestamp: timestamp || Date.now(),
+        delivered: false
+      };
+
+      // Store message
+      room.messages.push(msgData);
+      if (room.messages.length > 200) {
+        room.messages.shift(); // Keep only last 200
+      }
+
+      // Broadcast to all users in room
+      io.to(roomCode).emit('receive_message', msgData);
+
+      // Acknowledge delivery
+      callback({ success: true, messageId, delivered: true });
+
+      console.log(`[${new Date().toISOString()}] Message from ${userInfo.userName} in ${roomCode}: ${message.substring(0, 50)}`);
+    } catch (error) {
+      console.error(`[${new Date().toISOString()}] Error in send_message:`, error);
+      callback({ success: false, error: error.message });
+    }
+  });
+
+  // Get room users
+  socket.on('get_room_users', ({ roomCode }, callback) => {
+    try {
+      const room = getOrCreateRoom(roomCode);
+      callback({
+        success: true,
+        users: room.users.map(u => ({ id: u.id, name: u.name })),
+        count: room.users.length
       });
-    });
-  }
-
-  on(event, callback) {
-    if (!this.listeners[event]) {
-      this.listeners[event] = [];
+    } catch (error) {
+      console.error(`[${new Date().toISOString()}] Error in get_room_users:`, error);
+      callback({ success: false, error: error.message });
     }
-    this.listeners[event].push(callback);
+  });
 
-    if (this.socket) {
-      this.socket.off(event);
-      this.socket.on(event, (data) => {
-        this.listeners[event].forEach((cb) => cb(data));
-      });
+  // Ping for connection check
+  socket.on('ping', (callback) => {
+    callback({ pong: true, timestamp: Date.now() });
+  });
+
+  // Disconnect
+  socket.on('disconnect', () => {
+    try {
+      const userInfo = userSockets.get(socket.id);
+      if (userInfo) {
+        const { userName, roomCode } = userInfo;
+        broadcastUserLeft(roomCode, userName);
+        console.log(`[${new Date().toISOString()}] ${userName} disconnected from ${roomCode}`);
+      }
+      userSockets.delete(socket.id);
+    } catch (error) {
+      console.error(`[${new Date().toISOString()}] Error in disconnect:`, error);
     }
-  }
+  });
+});
 
-  off(event) {
-    if (this.listeners[event]) {
-      delete this.listeners[event];
-    }
-    if (this.socket) {
-      this.socket.off(event);
-    }
-  }
-
-  emit(event, data) {
-    if (!this.listeners[event]) return;
-    this.listeners[event].forEach((cb) => cb(data));
-  }
-
-  onReceiveMessage(callback) {
-    this.on('receive_message', callback);
-  }
-
-  onUserJoined(callback) {
-    this.on('user_joined', callback);
-  }
-
-  onUserLeft(callback) {
-    this.on('user_left', callback);
-  }
-
-  onConnectionChange(callback) {
-    this.on('connected', () => callback(true));
-    this.on('disconnected', () => callback(false));
-    this.on('reconnected', () => callback(true));
-  }
-
-  disconnect() {
-    if (this.socket) {
-      this.socket.disconnect();
-      this.isConnected = false;
-      console.log('[SocketService] Disconnected');
-    }
-  }
-
-  getConnectionStatus() {
-    return {
-      isConnected: this.isConnected,
-      socketId: this.socket?.id || null,
-    };
+// Helper function to broadcast user left
+function broadcastUserLeft(roomCode, userName) {
+  const room = getOrCreateRoom(roomCode);
+  room.users = room.users.filter(u => u.name !== userName);
+  
+  io.to(roomCode).emit('user_left', {
+    userName,
+    timestamp: Date.now(),
+    users: room.users.map(u => ({ id: u.id, name: u.name })),
+    count: room.users.length
+  });
+  
+  // Clean up empty room after 1 hour
+  if (room.users.length === 0) {
+    setTimeout(() => {
+      const r = rooms.get(roomCode);
+      if (r && r.users.length === 0) {
+        rooms.delete(roomCode);
+        console.log(`[${new Date().toISOString()}] Cleaned up empty room: ${roomCode}`);
+      }
+    }, 60 * 60 * 1000);
   }
 }
 
-const socketService = new SocketService();
-export default socketService;
+// Error handling
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('[ERROR] Unhandled Rejection at:', promise, 'reason:', reason);
+});
+
+process.on('uncaughtException', (error) => {
+  console.error('[ERROR] Uncaught Exception:', error);
+  process.exit(1);
+});
+
+server.listen(PORT, '0.0.0.0', () => {
+  console.log(`
+╔════════════════════════════════════════════════════════╗
+║  Socket.IO Chat Server Running                         ║
+║  PORT: ${PORT}                                              ║
+║  Environment: ${process.env.NODE_ENV || 'development'}                          ║
+║  URL: ${process.env.RAILWAY_PUBLIC_DOMAIN ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}` : `http://localhost:${PORT}`}  ║
+╚════════════════════════════════════════════════════════╝
+  `);
+});
+
+module.exports = server;
